@@ -1,0 +1,11 @@
+{
+  "slug": "superconductors",
+  "title": "Superconducting Materials",
+  "category": "Computational Condensed Matter",
+  "status": "live",
+  "priority": 85,
+  "summary": "Anti-hallucination crystal discovery funnel: CIF sanity, MLIP hull stability, and K=2 volunteer Quantum ESPRESSO DFPT-EPW Tc verification.",
+  "badge_ceiling": "Nominated for synthesis (DFT-EPW)",
+  "verifier_image": "ghcr.io/aiignment/agihome-materials@sha256:0000000000000000000000000000000000000000000000000000000000000002",
+  "honesty_statement": "We verify computations, never physical claims. No machine-learning score ever earns a Verified badge. Only candidates passing K=2 independent Quantum ESPRESSO phonon stability and Eliashberg Tc calculations reach Nominated for synthesis."
+}

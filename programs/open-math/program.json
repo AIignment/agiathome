@@ -1,0 +1,11 @@
+{
+  "slug": "open-math",
+  "title": "Open Mathematics (Lean 4)",
+  "category": "Formal Mathematics",
+  "status": "live",
+  "priority": 100,
+  "summary": "Machine-checked Lean 4 proofs and counterexamples for open conjectures, Erdős problems, and reusable lemma DAGs.",
+  "badge_ceiling": "Kernel-checked · CI",
+  "verifier_image": "ghcr.io/aiignment/agihome-lean-mathlib@sha256:0000000000000000000000000000000000000000000000000000000000000001",
+  "honesty_statement": "Every accepted proof or counterexample is compiled by two independent volunteers against pinned Lean 4 and Mathlib4, audited for standard axioms only, and confirmed in GitHub Actions CI."
+}
