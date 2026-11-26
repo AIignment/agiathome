@@ -12,6 +12,7 @@ import math
 import os
 import platform
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -296,8 +297,17 @@ def load_or_register(
         "handle": data["handle"],
         "token": data["token"],
     }
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    os.makedirs(os.path.dirname(cfg_path) or ".", mode=0o700, exist_ok=True)
+    fd = os.open(cfg_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
     try:
         os.chmod(cfg_path, 0o600)
     except OSError:
@@ -720,6 +730,71 @@ def _safe_step_dirname(step_id: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in step_id)[:80] or "step"
 
 
+MAX_STREAM_BYTES = 4 * 1024 * 1024
+APPROVED_IMAGE_PREFIXES = ("ghcr.io/aiignment/agihome-", "agihome-")
+
+
+def _validate_runner_image(image: str) -> None:
+    if not image or not isinstance(image, str):
+        raise ValueError("Missing container image")
+    if os.environ.get("AGI_ALLOW_UNPINNED_IMAGES") == "1":
+        return
+    has_digest = "@sha256:" in image and len(image.split("@sha256:", 1)[1]) == 64
+    is_approved = any(image.startswith(prefix) for prefix in APPROVED_IMAGE_PREFIXES)
+    if not (has_digest or is_approved):
+        raise ValueError(
+            f"Refusing unapproved runner image '{image}'. Pin a @sha256 digest or use an official ghcr.io/aiignment/agihome-* image."
+        )
+
+
+def _read_stream_capped(stream, limit: int, out_bucket: list):
+    buf = bytearray()
+    try:
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            rem = limit - len(buf)
+            if rem > 0:
+                buf.extend(chunk[:rem])
+    except Exception:
+        pass
+    finally:
+        out_bucket.append(bytes(buf))
+
+
+def _read_trusted_output_file(out_dir: str, filename: str, max_bytes: int) -> bytes | None:
+    if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
+        return None
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    dir_fd = -1
+    try:
+        dir_fd = os.open(out_dir, dir_flags)
+        fd = os.open(filename, file_flags, dir_fd=dir_fd)
+    except OSError:
+        return None
+    finally:
+        if dir_fd >= 0:
+            os.close(dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > max_bytes:
+            os.close(fd)
+            return None
+        with os.fdopen(fd, "rb") as f:
+            data = f.read(max_bytes + 1)
+        if len(data) == 0 or len(data) > max_bytes:
+            return None
+        return data
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None
+
+
 def run_docker_job(
     image: str,
     mode: str,
@@ -780,6 +855,7 @@ def run_docker_job(
             "--cap-drop=ALL",
             "--pids-limit=256",
             "--security-opt", "no-new-privileges",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=256m",
             f"--cpus={max_cpu}",
             f"--memory={max_ram}",
             "-e", f"AGI_MODE={mode}",
@@ -795,33 +871,42 @@ def run_docker_job(
             cmd.extend(["-v", f"{target_path}:/work/target.json:ro"])
         cmd.append(image)
 
+        _validate_runner_image(image)
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         hb.set_container(cname)
         hb.set_process(proc)
+        out_bucket: list[bytes] = []
+        err_bucket: list[bytes] = []
+        t_out = threading.Thread(target=_read_stream_capped, args=(proc.stdout, MAX_STREAM_BYTES, out_bucket), daemon=True)
+        t_err = threading.Thread(target=_read_stream_capped, args=(proc.stderr, MAX_STREAM_BYTES, err_bucket), daemon=True)
+        t_out.start()
+        t_err.start()
         try:
-            stdout_b, stderr_b = proc.communicate(timeout=timeout_sec)
+            proc.wait(timeout=timeout_sec)
         except subprocess.TimeoutExpired:
             subprocess.run(["docker", "kill", cname], capture_output=True, timeout=10)
             proc.kill()
-            stdout_b, stderr_b = proc.communicate()
+            proc.wait(timeout=10)
+            t_out.join(timeout=2)
+            t_err.join(timeout=2)
             return 124, None, {}, sha256_hex(b"timeout"), "Container timed out."
         finally:
             hb.set_process(None)
             hb.set_container(None)
+        t_out.join(timeout=5)
+        t_err.join(timeout=5)
+        stdout_b = out_bucket[0] if out_bucket else b""
+        stderr_b = err_bucket[0] if err_bucket else b""
 
         stdout_s = stdout_b.decode("utf-8", errors="replace")
         stderr_s = stderr_b.decode("utf-8", errors="replace")
         combined = (stdout_s + "\n" + stderr_s).strip()
 
-        artifact_path = os.path.join(out_dir, "artifact.json")
-        result_path = os.path.join(out_dir, "result.json")
-        artifact_bytes: bytes | None = None
+        artifact_bytes = _read_trusted_output_file(out_dir, "artifact.json", 16 * 1024 * 1024)
         metrics: dict = {}
         out_hash = sha256_hex(combined.encode("utf-8"))
 
-        if os.path.isfile(artifact_path) and os.path.getsize(artifact_path) > 0:
-            with open(artifact_path, "rb") as f:
-                artifact_bytes = f.read()
+        if artifact_bytes is not None:
             try:
                 parsed = json.loads(artifact_bytes.decode("utf-8"))
                 if isinstance(parsed, dict):
@@ -835,10 +920,10 @@ def run_docker_job(
         elif stdout_b.strip():
             artifact_bytes = stdout_b.strip()
 
-        if os.path.isfile(result_path) and os.path.getsize(result_path) > 0:
+        result_bytes = _read_trusted_output_file(out_dir, "result.json", 1024 * 1024)
+        if result_bytes is not None:
             try:
-                with open(result_path, "r", encoding="utf-8") as f:
-                    res_obj = json.load(f)
+                res_obj = json.loads(result_bytes.decode("utf-8"))
                 if isinstance(res_obj, dict):
                     if isinstance(res_obj.get("output_hash"), str) and res_obj["output_hash"]:
                         out_hash = res_obj["output_hash"]
@@ -963,7 +1048,7 @@ def cmd_loop(args):
         config_path=args.config,
     )
     print(
-        f"Starting AGI@home runner as {cfg['handle']} kinds={kinds} "
+        f"[connected] AGI@home runner as {cfg['handle']} kinds={kinds} "
         f"programs={programs_list or 'all'} docker={hw['has_docker']} builtin={builtin_allowed}"
     )
 
@@ -996,15 +1081,16 @@ def cmd_loop(args):
             token=cfg["token"],
             payload=next_payload,
         )
-        if status == 204 or not lease or not lease.get("lease_id"):
+        if status not in (200, 204):
+            err_detail = lease.get("error") if isinstance(lease, dict) else lease
+            print(f"[error] Desk returned HTTP {status}: {err_detail}", file=sys.stderr)
             if args.once:
-                print("No open tasks available.")
-                return
+                sys.exit(1)
             time.sleep(args.poll)
             continue
-        if status != 200:
-            print(f"Desk returned {status}: {lease}", file=sys.stderr)
+        if status == 204 or not lease or not lease.get("lease_id"):
             if args.once:
+                print("[waiting] No open tasks available.")
                 return
             time.sleep(args.poll)
             continue

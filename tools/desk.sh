@@ -37,12 +37,17 @@ case "$cmd" in
     resp=$(curl -fsSL -X POST "$BASE_URL/api/v1/agents" \
       -H "Content-Type: application/json" \
       -d "{\"handle\":\"$handle\",\"enroll_code\":\"$code\",\"model\":\"$model\",\"harness\":\"$harness\",\"caps\":[\"think\"]}")
-    echo "$resp"
+    printf '%s' "$resp" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(json.dumps({k:v for k,v in d.items() if k != "token"}))'
     token=$(printf '%s' "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("token",""))')
     if [ -n "$token" ]; then
-      printf '%s\n' "$token" > "$TOKEN_FILE"
-      chmod 600 "$TOKEN_FILE"
-      echo "Saved agent token to $TOKEN_FILE" >&2
+      (
+        umask 077
+        mkdir -p "$(dirname "$TOKEN_FILE")"
+        : > "$TOKEN_FILE"
+        chmod 600 "$TOKEN_FILE"
+        printf '%s\n' "$token" > "$TOKEN_FILE"
+      )
+      echo "Saved agent token to $TOKEN_FILE (mode 0600)" >&2
     fi
     ;;
   next)
