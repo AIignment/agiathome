@@ -8,6 +8,8 @@ if [ ! -s "$SUBMISSION" ]; then
 fi
 
 cp "$SUBMISSION" /tmp/Submission.lean
+cd /tmp
+
 export LEAN_PATH="/tmp"
 
 BUILD_LOG=$(mktemp /tmp/lean-build.XXXXXX)
@@ -22,81 +24,89 @@ if grep -qE "declaration uses 'sorry'|sorryAx" "$BUILD_LOG"; then
   exit 1
 fi
 
-CHECK_FILE="/tmp/Check.lean"
-printf "import Submission\n" > "$CHECK_FILE"
+python3 - <<'PY'
+import os
+import re
+import subprocess
+import sys
 
-if [ -n "${TARGET_THEOREM:-}" ]; then
-  printf "#print axioms %s\n" "$TARGET_THEOREM" >> "$CHECK_FILE"
-  DECL_COUNT=1
-else
-  DECLS=$(awk '
-    BEGIN { depth = 0 }
-    /^[[:space:]]*namespace[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*/ {
-      line = $0
-      sub(/^[[:space:]]*namespace[[:space:]]+/, "", line)
-      sub(/[[:space:]].*$/, "", line)
-      depth++
-      ns[depth] = line
-      next
-    }
-    /^[[:space:]]*end[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*/ {
-      if (depth > 0) depth--
-      next
-    }
-    /^[[:space:]]*(private[[:space:]]+|protected[[:space:]]+)?(theorem|lemma|def)[[:space:]]+[A-Za-z_][A-Za-z0-9_.\x27]*/ {
-      line = $0
-      sub(/^[[:space:]]*(private[[:space:]]+|protected[[:space:]]+)?(theorem|lemma|def)[[:space:]]+/, "", line)
-      sub(/[[:space:]:({\[].*$/, "", line)
-      prefix = ""
-      for (i = 1; i <= depth; i++) {
-        prefix = (prefix == "" ? ns[i] : prefix "." ns[i])
-      }
-      if (prefix != "") print prefix "." line
-      else print line
-    }
-  ' /tmp/Submission.lean)
+with open("/tmp/Submission.lean", "r", encoding="utf-8") as f:
+    src = f.read()
 
-  DECL_COUNT=0
-  for decl in $DECLS; do
-    printf "#print axioms %s\n" "$decl" >> "$CHECK_FILE"
-    DECL_COUNT=$((DECL_COUNT + 1))
-  done
-fi
+target_theorem = os.environ.get("TARGET_THEOREM", "").strip()
+target_signature = os.environ.get("TARGET_SIGNATURE", "").strip()
 
-if [ "$DECL_COUNT" -eq 0 ]; then
-  echo "Rejected: no verifiable theorem or definition found" >&2
-  exit 1
-fi
+if not target_theorem and os.path.exists("/work/target.json"):
+    import json
+    with open("/work/target.json", "r", encoding="utf-8") as tf:
+        tdata = json.load(tf)
+        target_theorem = str(tdata.get("theorem", "")).strip()
+        target_signature = str(tdata.get("signature", "")).strip()
 
-AXIOM_LOG=$(mktemp /tmp/lean-axioms.XXXXXX)
-if ! lean "$CHECK_FILE" >"$AXIOM_LOG" 2>&1; then
-  cat "$AXIOM_LOG" >&2
-  exit 1
-fi
-cat "$AXIOM_LOG"
+decls = []
+if target_theorem:
+    decls = [target_theorem]
+else:
+    ns_stack = []
+    for raw_line in src.splitlines():
+        m_ns = re.match(r"^\s*namespace\s+([A-Za-z_][A-Za-z0-9_.]*)", raw_line)
+        if m_ns:
+            ns_stack.append(m_ns.group(1))
+            continue
+        if re.match(r"^\s*end\s+[A-Za-z_][A-Za-z0-9_.]*", raw_line):
+            if ns_stack:
+                ns_stack.pop()
+            continue
+        m_decl = re.match(
+            r"^\s*(?:private\s+|protected\s+)?(?:theorem|lemma|def)\s+([A-Za-z_][A-Za-z0-9_.']*)",
+            raw_line,
+        )
+        if m_decl:
+            name = m_decl.group(1)
+            full = ".".join(ns_stack + [name]) if ns_stack else name
+            decls.append(full)
 
-if grep -qE "sorryAx|Lean\.ofReduceBool|Lean\.trustCompiler" "$AXIOM_LOG"; then
-  echo "Rejected: forbidden axiom detected" >&2
-  exit 1
-fi
+if not decls:
+    print("Rejected: no verifiable declarations found", file=sys.stderr)
+    sys.exit(1)
 
-BAD_AXIOMS=$(awk '
-  /depends on axioms:/ {
-    line = $0
-    sub(/^.*depends on axioms: \[/, "", line)
-    sub(/\].*$/, "", line)
-    n = split(line, arr, /,[[:space:]]*/)
-    for (i = 1; i <= n; i++) {
-      ax = arr[i]
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", ax)
-      if (ax != "" && ax != "propext" && ax != "Classical.choice" && ax != "Quot.sound") {
-        print ax
-      }
-    }
-  }
-' "$AXIOM_LOG")
+lines = ["import Submission"]
+if target_theorem and target_signature:
+    lines.append(
+        f"theorem agihome_target_check {target_signature} := by\n"
+        f"  first\n  | exact {target_theorem}\n  | apply {target_theorem} <;> assumption"
+    )
+    decls.append("agihome_target_check")
+for d in decls:
+    lines.append(f"#print axioms {d}")
 
-if [ -n "$BAD_AXIOMS" ]; then
-  echo "Rejected: non-standard axioms detected: $BAD_AXIOMS" >&2
-  exit 1
-fi
+check_path = "/tmp/Check.lean"
+with open(check_path, "w", encoding="utf-8") as cf:
+    cf.write("\n".join(lines) + "\n")
+
+proc = subprocess.run(["lean", check_path], capture_output=True, text=True)
+combined = (proc.stdout + "\n" + proc.stderr).strip()
+if combined:
+    print(combined)
+if proc.returncode != 0:
+    sys.exit(proc.returncode)
+
+allowed = {"propext", "Classical.choice", "Quot.sound"}
+checked = 0
+for line in combined.splitlines():
+    if "does not depend on any axioms" in line:
+        checked += 1
+        continue
+    m_ax = re.search(r"depends on axioms:\s*\[([^\]]*)\]", line)
+    if m_ax:
+        checked += 1
+        axioms = [a.strip() for a in m_ax.group(1).split(",") if a.strip()]
+        bad = [a for a in axioms if a not in allowed]
+        if bad:
+            print(f"Rejected: disallowed axioms {bad}", file=sys.stderr)
+            sys.exit(1)
+
+if checked < len(decls):
+    print("Rejected: incomplete axiom audit", file=sys.stderr)
+    sys.exit(1)
+PY

@@ -5,7 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH="/opt/elan/bin:${PATH}"
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates curl git gawk && \
+    apt-get install -y --no-install-recommends ca-certificates curl git python3 && \
     rm -rf /var/lib/apt/lists/* && \
     curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | \
       sh -s -- -y --default-toolchain leanprover/lean4:v4.14.0 --no-modify-path && \

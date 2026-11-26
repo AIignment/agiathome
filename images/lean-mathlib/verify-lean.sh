@@ -8,6 +8,7 @@ if [ ! -s "$SUBMISSION" ]; then
 fi
 
 cp "$SUBMISSION" /tmp/Submission.lean
+cd /tmp
 
 MATHLIB_PATHS=$(find /opt/mathlib-workspace/.lake -type d -name lean -path '*/build/lib/lean' | tr '\n' ':')
 export LEAN_PATH="/tmp:${MATHLIB_PATHS}"
@@ -72,7 +73,11 @@ if not decls:
 
 lines = ["import Mathlib", "import Submission"]
 if target_theorem and target_signature:
-    lines.append(f"example : {target_signature} := {target_theorem}")
+    lines.append(
+        f"theorem agihome_target_check {target_signature} := by\n"
+        f"  first\n  | exact {target_theorem}\n  | apply {target_theorem} <;> assumption"
+    )
+    decls.append("agihome_target_check")
 for d in decls:
     lines.append(f"#print axioms {d}")
 

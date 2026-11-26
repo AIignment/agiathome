@@ -1,0 +1,7 @@
+.agihome-token
+.env
+.lake/
+*.pyc
+__pycache__/
+.venv/
+work/
