@@ -731,19 +731,19 @@ def _safe_step_dirname(step_id: str) -> str:
 
 
 MAX_STREAM_BYTES = 4 * 1024 * 1024
-APPROVED_IMAGE_PREFIXES = ("ghcr.io/aiignment/agihome-", "agihome-")
+APPROVED_IMAGE_PREFIXES = ("ghcr.io/aiignment/agihome-",)
 
 
 def _validate_runner_image(image: str) -> None:
     if not image or not isinstance(image, str):
         raise ValueError("Missing container image")
-    if os.environ.get("AGI_ALLOW_UNPINNED_IMAGES") == "1":
-        return
-    has_digest = "@sha256:" in image and len(image.split("@sha256:", 1)[1]) == 64
-    is_approved = any(image.startswith(prefix) for prefix in APPROVED_IMAGE_PREFIXES)
-    if not (has_digest or is_approved):
+    parts = image.split("@sha256:", 1)
+    digest = parts[1] if len(parts) == 2 else ""
+    has_digest = len(digest) == 64 and all(c in "0123456789abcdefABCDEF" for c in digest)
+    is_approved = any(parts[0].startswith(prefix) for prefix in APPROVED_IMAGE_PREFIXES)
+    if not (has_digest and is_approved):
         raise ValueError(
-            f"Refusing unapproved runner image '{image}'. Pin a @sha256 digest or use an official ghcr.io/aiignment/agihome-* image."
+            f"Refusing unapproved runner image '{image}'. Must be an official ghcr.io/aiignment/agihome-* image pinned with @sha256."
         )
 
 
@@ -1357,7 +1357,7 @@ def cmd_link(args):
         print(f"Link failed ({status}): {resp}", file=sys.stderr)
         sys.exit(1)
     print(
-        f"Linked agent {cfg['handle']} to @{resp.get('account_handle')} "
+        f"Linked agent {cfg['handle']} to {resp.get('account_handle')} "
         f"(backfilled {resp.get('backfilled_credits', 0)} credits)"
     )
 
