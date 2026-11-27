@@ -5,12 +5,14 @@ AGI@home distributed compute & verification runner.
 """
 
 import argparse
+import base64
 import datetime
 import hashlib
 import json
 import math
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -20,6 +22,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 import uuid
 
 DEFAULT_BASE = os.environ.get("AGI_BASE", "https://agi.alignment.id")
@@ -142,6 +145,19 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            old, new = urllib.parse.urlsplit(req.full_url), urllib.parse.urlsplit(newurl)
+            if (old.scheme, old.hostname, old.port) != (new.scheme, new.hostname, new.port):
+                redirected.remove_header("Authorization")
+        return redirected
+
+
+HTTP_OPENER = urllib.request.build_opener(SafeRedirectHandler())
+
+
 def api_request(base, path, method="GET", token=None, payload=None, headers=None, timeout=30):
     req_headers = {"User-Agent": USER_AGENT}
     if token:
@@ -155,7 +171,7 @@ def api_request(base, path, method="GET", token=None, payload=None, headers=None
     url = f"{base.rstrip('/')}{path}"
     req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with HTTP_OPENER.open(req, timeout=timeout) as resp:
             raw = resp.read()
             if resp.status == 204 or not raw:
                 return resp.status, None
@@ -176,7 +192,7 @@ def api_download_bytes(base, path, token=None, timeout=60) -> bytes:
         req_headers["Authorization"] = f"Bearer {token}"
     url = f"{base.rstrip('/')}{path}"
     req = urllib.request.Request(url, headers=req_headers, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with HTTP_OPENER.open(req, timeout=timeout) as resp:
         return resp.read()
 
 
@@ -219,7 +235,7 @@ def api_submit_multipart(
     url = f"{base.rstrip('/')}{path}"
     req = urllib.request.Request(url, data=body, headers=req_headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with HTTP_OPENER.open(req, timeout=timeout) as resp:
             raw = resp.read()
             if not raw:
                 return resp.status, None
@@ -258,18 +274,24 @@ def load_or_register(
         }
 
     cfg_path = config_path or DEFAULT_CONFIG_PATH
-    if os.path.exists(cfg_path) and not enroll_code:
+    if os.path.exists(cfg_path):
         try:
             with open(cfg_path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
-            if (
-                cfg.get("base") == base
-                and cfg.get("token")
-                and (not handle or cfg.get("handle") == handle)
-            ):
-                return cfg
         except Exception:
-            pass
+            cfg = None
+        if (
+            isinstance(cfg, dict)
+            and cfg.get("base") == base
+            and cfg.get("token")
+            and (enroll_code or not handle or cfg.get("handle") == handle)
+        ):
+            if enroll_code:
+                print(
+                    f"Using saved credentials for {cfg.get('handle')} in {cfg_path}; ignoring --enroll.",
+                    file=sys.stderr,
+                )
+            return cfg
 
     hw = hardware or detect_hardware()
     cap_list = list(dict.fromkeys((caps or ["verify", "crunch"]) + (["docker"] if hw.get("has_docker") else ["builtin"])))
@@ -290,14 +312,13 @@ def load_or_register(
         print(f"Registration failed ({status}): {data}", file=sys.stderr)
         sys.exit(1)
 
-    os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+    os.makedirs(os.path.dirname(cfg_path) or ".", mode=0o700, exist_ok=True)
     cfg = {
         "base": base,
         "agent_id": data["agent_id"],
         "handle": data["handle"],
         "token": data["token"],
     }
-    os.makedirs(os.path.dirname(cfg_path) or ".", mode=0o700, exist_ok=True)
     fd = os.open(cfg_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -507,12 +528,12 @@ def _run_monte_carlo(params: dict) -> tuple[dict, dict]:
 
 def _extract_faers_counts(params: dict, input_blobs: list[bytes] | None = None) -> tuple[float, float, float, float]:
     src = params
-    if all(k in src for k in ("a", "b", "c", "d")):
+    if all(type(src.get(k)) is int and src[k] >= 0 for k in ("a", "b", "c", "d")):
         return float(src["a"]), float(src["b"]), float(src["c"]), float(src["d"])
 
     if isinstance(src.get("contingency"), dict):
         ct = src["contingency"]
-        if all(k in ct for k in ("a", "b", "c", "d")):
+        if all(type(ct.get(k)) is int and ct[k] >= 0 for k in ("a", "b", "c", "d")):
             return float(ct["a"]), float(ct["b"]), float(ct["c"]), float(ct["d"])
 
     if input_blobs:
@@ -523,9 +544,9 @@ def _extract_faers_counts(params: dict, input_blobs: list[bytes] | None = None) 
                 parsed = json.loads(raw.decode("utf-8"))
             except Exception:
                 continue
-            rows = parsed if isinstance(parsed, list) else parsed.get("records", [parsed])
+            rows = parsed if isinstance(parsed, list) else parsed.get("records", [parsed]) if isinstance(parsed, dict) else []
             for row in rows:
-                if isinstance(row, dict) and all(k in row for k in ("a", "b", "c", "d")):
+                if isinstance(row, dict) and all(type(row.get(k)) is int and row[k] >= 0 for k in ("a", "b", "c", "d")):
                     a_sum += float(row["a"])
                     b_sum += float(row["b"])
                     c_sum += float(row["c"])
@@ -534,20 +555,10 @@ def _extract_faers_counts(params: dict, input_blobs: list[bytes] | None = None) 
         if found:
             return a_sum, b_sum, c_sum, d_sum
 
-    # Deterministic cohort slice derived from shard range when raw counts aren't attached
-    range_start = int(params.get("range_start", params.get("start", 0)))
-    range_end = int(params.get("range_end", params.get("end", range_start + 1000)))
-    span = max(10, range_end - range_start)
-    seed = int(params.get("seed", 7))
-    state = ((seed * 0x517CC1B727220A95) ^ (range_start * 0x9E3779B97F4A7C15)) & MASK64
-    state, z1 = _splitmix64_next(state)
-    state, z2 = _splitmix64_next(state)
-    state, z3 = _splitmix64_next(state)
-    a = float(12 + (z1 % max(10, span // 10)))
-    b = float(80 + (z2 % max(40, span // 2)))
-    c = float(45 + (z3 % max(30, span // 3)))
-    d = float(max(500, span * 4))
-    return a, b, c, d
+    raise ValueError(
+        "faers_disprop step carries no real 2x2 counts: params have no integer a, b, c, d "
+        "(directly or under 'contingency') and no input blob supplies them. Refusing to invent numbers."
+    )
 
 
 def _run_faers_disprop(params: dict, input_blobs: list[bytes] | None = None) -> tuple[dict, dict]:
@@ -622,6 +633,95 @@ def _run_hash_search(params: dict) -> tuple[dict, dict]:
     return artifact, metrics
 
 
+BUILTIN_WORKER_ARG = "_builtin_worker"
+RAM_UNIT_BYTES = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
+
+
+def parse_ram_bytes(spec) -> int:
+    m = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*([kmgt]?)\s*i?b?\s*", str(spec or "").lower())
+    if not m:
+        raise ValueError(f"Unrecognised --max-ram value {spec!r}; use for example 4g, 2048m, or 512m.")
+    return int(float(m.group(1)) * RAM_UNIT_BYTES[m.group(2)])
+
+
+def _limits_supported() -> bool:
+    try:
+        import resource
+    except Exception:
+        return False
+    return os.name == "posix"
+
+
+def _builtin_worker_main() -> int:
+    import resource
+
+    payload = json.loads(sys.stdin.read())
+    max_cpu = float(payload.get("max_cpu") or 1.0)
+    max_ram_bytes = int(payload.get("max_ram_bytes") or 0)
+    budget_sec = max(1, int(payload.get("budget_sec") or 900))
+    cpu_sec = max(1, int(math.ceil(max_cpu * budget_sec)))
+    resource.setrlimit(resource.RLIMIT_CPU, (cpu_sec, cpu_sec))
+    if max_ram_bytes > 0:
+        for name in ("RLIMIT_AS", "RLIMIT_DATA"):
+            res = getattr(resource, name, None)
+            if res is None:
+                continue
+            try:
+                resource.setrlimit(res, (max_ram_bytes, max_ram_bytes))
+                break
+            except (ValueError, OSError):
+                continue
+        else:
+            raise RuntimeError("Cannot enforce builtin memory limit on this platform")
+    blobs = [base64.b64decode(b) for b in payload.get("blobs") or []]
+    artifact, metrics = run_builtin_task(payload["task_type"], payload.get("params") or {}, blobs)
+    sys.stdout.write(json.dumps({"artifact": artifact, "metrics": metrics}))
+    return 0
+
+
+def run_builtin_limited(
+    task_type: str,
+    params: dict,
+    input_blobs: list[bytes] | None = None,
+    max_cpu: float | None = None,
+    max_ram: str | None = None,
+    budget_sec: int = 900,
+) -> tuple[dict, dict]:
+    if max_cpu is None and max_ram is None:
+        return run_builtin_task(task_type, params, input_blobs)
+    if not _limits_supported():
+        return run_builtin_task(task_type, params, input_blobs)
+
+    cpu = float(max_cpu) if max_cpu is not None else float(os.cpu_count() or 1)
+    ram_bytes = parse_ram_bytes(max_ram or "4g")
+    payload = {
+        "task_type": task_type,
+        "params": params,
+        "blobs": [base64.b64encode(b).decode("ascii") for b in (input_blobs or [])],
+        "max_cpu": cpu,
+        "max_ram_bytes": ram_bytes,
+        "budget_sec": max(1, int(budget_sec)),
+    }
+    cpu_sec = max(1, int(math.ceil(cpu * max(1, int(budget_sec)))))
+    proc = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), BUILTIN_WORKER_ARG],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=cpu_sec + 60,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[-400:]
+        if proc.returncode < 0:
+            sig = -proc.returncode
+            raise RuntimeError(
+                f"Builtin worker killed by signal {sig} under --max-cpu={cpu} --max-ram={max_ram}: {detail}"
+            )
+        raise RuntimeError(f"Builtin worker failed (rc={proc.returncode}) under --max-cpu={cpu} --max-ram={max_ram}: {detail}")
+    parsed = json.loads(proc.stdout)
+    return parsed["artifact"], parsed["metrics"]
+
+
 def run_builtin_task(task_type: str, params: dict, input_blobs: list[bytes] | None = None) -> tuple[dict, dict]:
     if task_type == "prime_range":
         return _run_prime_range(params)
@@ -640,10 +740,17 @@ def verify_builtin_artifact(
     submitted_bytes: bytes,
     input_blobs: list[bytes] | None = None,
     tol: float = 1e-4,
+    max_cpu: float | None = None,
+    max_ram: str | None = None,
+    budget_sec: int = 900,
 ) -> tuple[str, str, dict, str]:
-    expected_artifact, expected_metrics = run_builtin_task(task_type, target_params, input_blobs)
+    expected_artifact, expected_metrics = run_builtin_limited(
+        task_type, target_params, input_blobs, max_cpu, max_ram, budget_sec
+    )
     expected_canonical = canonical_json_bytes(expected_artifact)
-    out_hash = sha256_hex(expected_canonical)
+    own_hash = sha256_hex(expected_canonical)
+    submitted_hash = sha256_hex(submitted_bytes)
+    out_hash = own_hash
 
     try:
         submitted = json.loads(submitted_bytes.decode("utf-8"))
@@ -678,10 +785,24 @@ def verify_builtin_artifact(
             if submitted[exact_key] != expected_artifact[exact_key]:
                 mismatches.append(f"{exact_key} mismatch")
 
-    if mismatches:
-        return "REJECTED", out_hash, expected_metrics, "Verification mismatch: " + "; ".join(mismatches)
+    if task_type == "faers_disprop":
+        for key in ("a", "b", "c", "d"):
+            want = expected_artifact[key]
+            got = submitted.get(key)
+            if not isinstance(got, int) or isinstance(got, bool):
+                mismatches.append(f"{key}: submitted artifact has no integer {key}")
+            elif got != want:
+                mismatches.append(f"{key}: got {got}, expected {want}")
 
-    return "ACCEPTED", out_hash, expected_metrics, f"Verified builtin {task_type} deterministically (sha={out_hash[:12]})"
+    if mismatches:
+        return "REJECTED", own_hash, expected_metrics, "Verification mismatch: " + "; ".join(mismatches)
+
+    return (
+        "ACCEPTED",
+        submitted_hash,
+        expected_metrics,
+        f"Verified builtin {task_type} deterministically (submitted sha={submitted_hash[:12]})",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -731,20 +852,19 @@ def _safe_step_dirname(step_id: str) -> str:
 
 
 MAX_STREAM_BYTES = 4 * 1024 * 1024
-APPROVED_IMAGE_PREFIXES = ("ghcr.io/aiignment/agihome-",)
+APPROVED_IMAGES = frozenset({
+    "ghcr.io/aiignment/agihome-lean-core",
+    "ghcr.io/aiignment/agihome-lean-mathlib",
+    "ghcr.io/aiignment/agihome-ci-verifier",
+})
 
 
 def _validate_runner_image(image: str) -> None:
-    if not image or not isinstance(image, str):
+    if not isinstance(image, str):
         raise ValueError("Missing container image")
-    parts = image.split("@sha256:", 1)
-    digest = parts[1] if len(parts) == 2 else ""
-    has_digest = len(digest) == 64 and all(c in "0123456789abcdefABCDEF" for c in digest)
-    is_approved = any(parts[0].startswith(prefix) for prefix in APPROVED_IMAGE_PREFIXES)
-    if not (has_digest and is_approved):
-        raise ValueError(
-            f"Refusing unapproved runner image '{image}'. Must be an official ghcr.io/aiignment/agihome-* image pinned with @sha256."
-        )
+    repo, separator, digest = image.partition("@sha256:")
+    if repo not in APPROVED_IMAGES or not separator or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError(f"Refusing unapproved or unpinned runner image '{image}'.")
 
 
 def _read_stream_capped(stream, limit: int, out_bucket: list):
@@ -822,6 +942,8 @@ def run_docker_job(
         out_dir = os.path.join(tmp, "out")
         os.makedirs(in_dir, exist_ok=True)
         os.makedirs(out_dir, exist_ok=True)
+        os.chmod(in_dir, 0o755)
+        os.chmod(out_dir, 0o733)
 
         download_input_blobs(base, token, execution.get("input_blobs") or [], dest_dir=in_dir)
 
@@ -846,6 +968,12 @@ def run_docker_job(
         with open(step_path, "wb") as f:
             f.write(canonical_json_bytes({"step": step, "execution": execution}))
 
+        for name in os.listdir(in_dir):
+            os.chmod(os.path.join(in_dir, name), 0o644)
+        for path in (params_path, step_path, target_path):
+            if path:
+                os.chmod(path, 0o644)
+
         cname = f"agihome-{uuid.uuid4().hex[:12]}"
         cmd = [
             "docker", "run", "--rm",
@@ -854,6 +982,8 @@ def run_docker_job(
             "--read-only",
             "--cap-drop=ALL",
             "--pids-limit=256",
+            "--user", "65534:65534",
+            "--ulimit", "nofile=1024:1024",
             "--security-opt", "no-new-privileges",
             "--tmpfs", "/tmp:rw,noexec,nosuid,size=256m",
             f"--cpus={max_cpu}",
@@ -862,7 +992,7 @@ def run_docker_job(
             "-v", f"{in_dir}:/work/in:ro",
             "-v", f"{params_path}:/work/params.json:ro",
             "-v", f"{step_path}:/work/step.json:ro",
-            "-v", f"{ckpt_dir}:/work/ckpt:rw",
+            "-v", f"{ckpt_dir}:/work/ckpt:ro",
             "-v", f"{out_dir}:/work/out:rw",
         ]
         if sub_path is not None:
@@ -904,33 +1034,19 @@ def run_docker_job(
 
         artifact_bytes = _read_trusted_output_file(out_dir, "artifact.json", 16 * 1024 * 1024)
         metrics: dict = {}
-        out_hash = sha256_hex(combined.encode("utf-8"))
-
-        if artifact_bytes is not None:
-            try:
-                parsed = json.loads(artifact_bytes.decode("utf-8"))
-                if isinstance(parsed, dict):
-                    out_hash = sha256_hex(canonical_json_bytes(parsed))
-                    if isinstance(parsed.get("metrics"), dict):
-                        metrics = {
-                            k: v for k, v in parsed["metrics"].items() if isinstance(v, (int, float))
-                        }
-            except Exception:
-                out_hash = sha256_hex(artifact_bytes)
-        elif stdout_b.strip():
+        if artifact_bytes is None and stdout_b.strip():
             artifact_bytes = stdout_b.strip()
+        out_hash = sha256_hex(submission_bytes if submission_bytes is not None else artifact_bytes or b"")
 
         result_bytes = _read_trusted_output_file(out_dir, "result.json", 1024 * 1024)
         if result_bytes is not None:
             try:
                 res_obj = json.loads(result_bytes.decode("utf-8"))
-                if isinstance(res_obj, dict):
-                    if isinstance(res_obj.get("output_hash"), str) and res_obj["output_hash"]:
-                        out_hash = res_obj["output_hash"]
-                    if isinstance(res_obj.get("metrics"), dict):
-                        metrics = {
-                            k: v for k, v in res_obj["metrics"].items() if isinstance(v, (int, float))
-                        }
+                if isinstance(res_obj, dict) and isinstance(res_obj.get("metrics"), dict):
+                    metrics = {
+                        k: v for k, v in res_obj["metrics"].items()
+                        if isinstance(k, str) and "hash" not in k.lower() and isinstance(v, (int, float))
+                    }
             except Exception:
                 pass
 
@@ -972,6 +1088,11 @@ def cmd_doctor(args):
         f"gpu={hw['gpu_name'] or 'none'} vram_gb={hw['vram_gb']}"
     )
     print(f"docker: {shutil.which('docker') or 'MISSING'} ({docker_status if has_docker else docker_status})")
+    if _limits_supported():
+        print("builtin limits: enforced by a worker subprocess with resource.setrlimit (RLIMIT_CPU, RLIMIT_AS)")
+    else:
+        print("builtin limits: NOT enforced on this platform; builtin tasks may use unbounded CPU and RAM")
+    print("  Docker uses --cpus/--memory; builtin --max-cpu limits total CPU time, not CPU rate or cores.")
     status, stats = api_request(args.base, "/api/v1/stats")
     print(f"desk {args.base}: HTTP {status}")
     if isinstance(stats, dict) and status == 200:
@@ -1118,7 +1239,9 @@ def cmd_loop(args):
                     args.base, cfg["token"], execution.get("input_blobs") or []
                 )
                 params = step.get("params") if isinstance(step.get("params"), dict) else {}
-                artifact, metrics = run_builtin_task(task_type, params, blobs)
+                artifact, metrics = run_builtin_limited(
+                    task_type, params, blobs, max_cpu, max_ram, max(60, int(args.heartbeat_interval * 20))
+                )
                 if hb.cancelled.is_set():
                     print(f"Step {step['id']} cancelled by Desk (410); skipping submit.")
                 else:
@@ -1182,7 +1305,13 @@ def cmd_loop(args):
                         )
                     else:
                         verdict, out_hash, metrics, log_tail = verify_builtin_artifact(
-                            eff_task_type, target_params, sub_bytes, blobs
+                            eff_task_type,
+                            target_params,
+                            sub_bytes,
+                            blobs,
+                            max_cpu=max_cpu,
+                            max_ram=max_ram,
+                            budget_sec=max(60, int(args.heartbeat_interval * 20)),
                         )
                         if hb.cancelled.is_set():
                             print(f"Verify step {step['id']} cancelled by Desk (410); skipping post.")
@@ -1385,8 +1514,17 @@ def main():
     p_loop.add_argument("--kinds", default="verify,crunch", help="Comma-separated step kinds")
     p_loop.add_argument("--program", default=None, help="Optional single program slug")
     p_loop.add_argument("--programs", default=None, help="Optional comma-separated program slugs")
-    p_loop.add_argument("--max-cpu", type=float, default=None, help="Max CPU cores for Docker containers")
-    p_loop.add_argument("--max-ram", default="4g", help="Max RAM limit for Docker containers (e.g. 4g)")
+    p_loop.add_argument(
+        "--max-cpu",
+        type=float,
+        default=None,
+        help="Docker CPU cores; builtin workers limit total CPU time, not CPU rate or cores.",
+    )
+    p_loop.add_argument(
+        "--max-ram",
+        default="4g",
+        help="Max RAM (e.g. 4g). Docker containers get --memory; builtin tasks run in a worker subprocess capped by RLIMIT_AS.",
+    )
     p_loop.add_argument("--until", default=None, help="Stop cleanly at local time HH:MM")
     p_loop.add_argument(
         "--allow-builtin",
@@ -1414,6 +1552,9 @@ def main():
     p_link.add_argument("--label", default="", help="Optional machine label")
     p_link.add_argument("--handle", default=None, help="Optional agent handle if registering fresh")
     p_link.set_defaults(func=cmd_link)
+
+    if len(sys.argv) == 2 and sys.argv[1] == BUILTIN_WORKER_ARG:
+        sys.exit(_builtin_worker_main())
 
     args = parser.parse_args()
     args.base = getattr(args, "sub_base", None) or args.base or DEFAULT_BASE
