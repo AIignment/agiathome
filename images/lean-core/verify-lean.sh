@@ -38,7 +38,13 @@ if [ -n "$TARGET_THEOREM" ]; then
     echo "Rejected: target theorem without a signature" >&2
     exit 1
   fi
-  if printf '%s' "$TARGET_SIGNATURE" | grep -qE '(\r|\n|#eval|#print|#check|import[[:space:]]|axiom[[:space:]]|unsafe[[:space:]]|initialize)'; then
+  case "$TARGET_SIGNATURE" in
+    *$'\n'*|*$'\r'*)
+      echo "Rejected: unsafe target signature" >&2
+      exit 1
+      ;;
+  esac
+  if printf '%s' "$TARGET_SIGNATURE" | grep -qE '(#eval|#print|#check|import[[:space:]]|axiom[[:space:]]|unsafe[[:space:]]|initialize)'; then
     echo "Rejected: unsafe target signature" >&2
     exit 1
   fi
